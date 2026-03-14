@@ -14,7 +14,7 @@ ACTION_TOKEN = '<ACTION{:05d}>'
 class ActionTokenizer:
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: PreTrainedTokenizerBase, # 语言模型的 tokenizer，用于添加动作 token 和进行 token id 转换 如果是EXTRA_TOKENS 预留的 token 范围是 [tokenizer.vocab_size, tokenizer.vocab_size + num_bins)，所以 tokenizer 的 vocab_size ,用于让 tokenizer 具备 PaliGemma 兼容词表能力？？
         num_bins: int = 256,
         min_action: int = -1,
         max_action: int = 1,

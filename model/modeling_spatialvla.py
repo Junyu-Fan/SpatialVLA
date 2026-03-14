@@ -33,12 +33,12 @@ from .configuration_spatialvla import SpatialVLAConfig
 from .modeling_gemma2 import Gemma2ForCausalLM
 from transformers import AutoModel, ZoeDepthForDepthEstimation
 
-SIGLIP_MEAN, SIGLIP_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+SIGLIP_MEAN, SIGLIP_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5) #归一化参数，适用于 SigLIP 视觉模型输入的图像预处理。SIGLIP_MEAN 和 SIGLIP_STD 分别表示图像每个通道的均值和标准差，用于将像素值归一化到一个特定的范围，从而提高模型的训练稳定性和性能。通常，这些值是根据训练数据集计算得出的，确保模型在训练和推理阶段能够正确地处理输入图像。
 ZOE_MEAN, ZOE_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
 
 logger = logging.get_logger(__name__)
 
-class Ego3DPositionEmbeddingMLP(nn.Module):
+class Ego3DPositionEmbeddingMLP(nn.Module): #输入：每个视觉patch对应的3D点（或拼接后的多点坐标）。输出：与视觉token同维度的位置特征。目的：把几何信息注入视觉token（不是只靠RGB外观）
     """Absolute pos embedding, learned.
     https://github.com/kwea123/nerf_pl/blob/52aeb387da64a9ad9a0f914ea9b049ffc598b20c/models/nerf.py#L4
     """
@@ -96,7 +96,7 @@ class Ego3DPositionEmbeddingMLP(nn.Module):
         position_embedding = self.position_embedding_head(freq_encoding)
         return position_embedding
 
-def process_zoe(pixel_values, pad_mode="reflect", output_size=(384, 512)):
+def process_zoe(pixel_values, pad_mode="reflect", output_size=(384, 512)): #为 ZoeDepth 做输入预处理：pad + resize + normalize。
     """https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/zoedepth/image_processing_zoedepth.py"""
     # h, w = images.shape[-2:]
     # pad
@@ -110,7 +110,7 @@ def process_zoe(pixel_values, pad_mode="reflect", output_size=(384, 512)):
     return images, ph, pw
 
 @dataclass
-class SpatialVLACausalLMOutputWithPast(ModelOutput):
+class SpatialVLACausalLMOutputWithPast(ModelOutput): #标准 HF 输出容器的扩展
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[Union[List[torch.FloatTensor], Cache]] = None
@@ -118,7 +118,7 @@ class SpatialVLACausalLMOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     image_hidden_states: Optional[torch.FloatTensor] = None
 
-class SpatialVLAMultiModalProjector(nn.Module):
+class SpatialVLAMultiModalProjector(nn.Module): #一个MLP 把视觉token映射到文本token所在嵌入空间
     def __init__(self, config: SpatialVLAConfig):
         super().__init__()
         self.linear = nn.Linear(config.vision_config.hidden_size, config.vision_config.projection_dim, bias=True)
@@ -325,7 +325,7 @@ class SpatialVLAForConditionalGeneration(SpatialVLAPreTrainedModel, GenerationMi
                     intrinsic, depth, patch_size=self.config.vision_config.patch_size, reso=self.config.ego3d_patch_reso
                 )  # (b, n, 3*4)
             pos_embed_3d = self.position_embedding_3d(xyz)
-            selected_image_feature = image_outputs.last_hidden_state + pos_embed_3d
+            selected_image_feature = image_outputs.last_hidden_state + pos_embed_3d #将 2D 特征与 3D 位置嵌入相加！！！ selected_image_feature 的形状为： (batch_size, num_patches, vision_hidden_size)
         else:
             selected_image_feature = image_outputs.last_hidden_state
         image_features = self.multi_modal_projector(selected_image_feature)
