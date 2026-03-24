@@ -25,6 +25,15 @@ ZOE_MEAN, ZOE_STD = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
 logger = logging.get_logger(__name__)
 
 
+# =============================================================================
+# 与原 SpatialVLA 的结构差异（Phase 1）
+# - 原 SpatialVLA: 2D 视觉特征 X 与 3D 位置嵌入 P' 直接相加后走同一个投影层。
+# - 本文件 UniModalVLA: RGB 与 Depth 是两条独立 token 流，分别走独立 projector，
+#   最终通过不同 special token 位置注入到 LLM 输入序列。
+# - 本阶段不包含 MoE（MoE 放在后续 Phase 2）。
+# =============================================================================
+
+
 class Ego3DPositionEmbeddingMLP(nn.Module):
     def __init__(self, in_channels=3, num_pos_feats=768, n_freqs=8, logscale=True):
         super().__init__()
@@ -94,7 +103,7 @@ class UniModalProjector(nn.Module):
         return self.linear(features)
 
 
-class UniModalVLAPreTrainedModel(PreTrainedModel):
+class UniModalVLAPreTrainedModel(PreTrainedModel): #下面给UniModalVLAForConditionalGeneration继承
     config_class = UniModalVLAConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -125,12 +134,14 @@ class UniModalVLAPreTrainedModel(PreTrainedModel):
 
 
 class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, GenerationMixin):
-    """Phase 1: no-MoE baseline with independent RGB/depth streams."""
+    """Phase 1: no-MoE baseline with independent RGB/depth streams.  主程序"""
 
     def __init__(self, config: UniModalVLAConfig, vision_model=None, vision_zoe_model=None, language_model=None):
         super().__init__(config)
 
-        self.vision_tower = vision_model or AutoModel.from_config(config=config.vision_config)
+        # 与原 SpatialVLA 不同：保留同一个视觉塔，但拆成两个投影头。
+        # RGB 特征 -> rgb_projector，Depth(P') 特征 -> depth_projector。
+        self.vision_tower = vision_model or AutoModel.from_config(config=config.vision_config) # 共享编码器：RGB 与深度 token 后续都在同一视觉特征空间工作（Phase 1 先保持简单）。？ 这个好像就在rgb_features里用到
         self.rgb_projector = UniModalProjector(config)
         self.depth_projector = UniModalProjector(config)
 
@@ -138,15 +149,17 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
             language_model = Gemma2ForCausalLM(config=config.text_config)
         if language_model._tied_weights_keys is not None:
             self._tied_weights_keys = [f"language_model.{k}" for k in language_model._tied_weights_keys]
-        self.language_model = language_model
+        self.language_model = language_model #挂载语言模型
 
         if config.use_depth_modality and config.use_vision_zoe:
-            self.vision_zoe_model = vision_zoe_model or ZoeDepthForDepthEstimation(config.vision_zoe_config)
+            # 与原 SpatialVLA 相同点：深度估计 + 反投影 + 高频位置编码。
+            # 与原 SpatialVLA 不同点：这里输出作为独立深度 token 流，不与 RGB 相加。
+            self.vision_zoe_model = vision_zoe_model or ZoeDepthForDepthEstimation(config.vision_zoe_config) #创建 ZoeDepth 网络，用 RGB 估计深度图
             self.position_embedding_3d = Ego3DPositionEmbeddingMLP(
                 config.ego3d_patch_reso ** 2 * 3,
                 num_pos_feats=config.vision_config.hidden_size,
                 n_freqs=config.n_freqs,
-            )
+            ) # 创建 3D 位置编码器：把反投影后的 patch 3D 点变成深度 token embedding（即 P'）。
             patch_size, reso, image_size = (
                 config.vision_config.patch_size,
                 config.ego3d_patch_reso,
@@ -210,6 +223,7 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
         inputs_embeds=None,
         is_training: bool = False,
     ):
+        # 用于在自回归生成或训练时正确屏蔽未来 token 的注意力
         if self.config.text_config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
@@ -261,18 +275,23 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
         return causal_mask
 
     def get_rgb_features(self, pixel_values: torch.FloatTensor):
+        # 主要的处理已经在processer里处理过了，这里直接过视觉塔 + 投影头得到 RGB 模态特征，作为 <image> token 的替换内容注入 LLM。
+        # RGB 独立分支：只编码视觉语义，不和深度分支做逐元素融合。
+        # 输入是图像张量 pixel_values，通常形状 (B, 3, H, W)。
         siglip_pixel_values = TF.normalize(pixel_values, mean=SIGLIP_MEAN, std=SIGLIP_STD)
         image_outputs = self.vision_tower(siglip_pixel_values)
-        rgb_features = self.rgb_projector(image_outputs.last_hidden_state)
-        rgb_features = rgb_features / (self.config.text_config.hidden_size ** 0.5)
+        rgb_features = self.rgb_projector(image_outputs.last_hidden_state) # 用 RGB 专用投影层把视觉维度映射到 LLM 输入维度，输出 (B, N_patch, D_text)。
+        rgb_features = rgb_features / (self.config.text_config.hidden_size ** 0.5) #尺度归一
         return rgb_features
 
     def get_depth_features(self, pixel_values: torch.FloatTensor, intrinsic: torch.FloatTensor, depth_values: Optional[torch.Tensor] = None):
-        if depth_values is None:
+        # Depth 独立分支：得到 P' 后走 depth_projector，作为深度模态 token。
+        # 注意：这里不执行 X + P'，这是和原 SpatialVLA 的关键区别。
+        if depth_values is None: #如果外部没给深度图，就走“RGB -> ZoeDepth”自动估计。
             if not hasattr(self, "vision_zoe_model"):
                 raise ValueError("depth_values is None and use_vision_zoe is disabled.")
             zoe_pixel_values, ph, pw = process_zoe(pixel_values, pad_mode="reflect")
-            with torch.no_grad():
+            with torch.no_grad(): #深度估计不用梯度
                 pvh, pvw = pixel_values.shape[-2:]
                 depth = self.vision_zoe_model(pixel_values=zoe_pixel_values).predicted_depth
                 depth = F.interpolate(
@@ -290,13 +309,15 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
             patch_size=self.config.vision_config.patch_size,
             reso=self.config.ego3d_patch_reso,
         )
-        depth_tokens = self.position_embedding_3d(xyz)
-        depth_features = self.depth_projector(depth_tokens)
-        depth_features = depth_features / (self.config.text_config.hidden_size ** 0.5)
+        depth_tokens = self.position_embedding_3d(xyz) #把 3D 点做频率编码 + MLP，得到深度模态 token
+        depth_features = self.depth_projector(depth_tokens) #用 depth 专用投影头映射到 LLM 维度 (B, N_patch, D_text)。
+        depth_features = depth_features / (self.config.text_config.hidden_size ** 0.5)# 尺度归一
         return depth_features
 
     @staticmethod
     def _replace_special_tokens_with_features(input_ids, inputs_embeds, token_id, features, token_name):
+        # 将某一类 special token (<image> 或 <depth>) 的 embedding 批量替换为对应模态特征。
+        # 这就是“拼接到 LLM 输入空间”的具体落点。
         special_mask = (input_ids == token_id).unsqueeze(-1)
         special_mask = special_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
         if inputs_embeds[special_mask].numel() != features.numel():
@@ -326,6 +347,10 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
         return_dict: Optional[bool] = None,
         num_logits_to_keep: int = 0,
     ) -> Union[Tuple, UniModalVLACausalLMOutputWithPast]:
+        # Phase 1 前向逻辑：
+        # 1) RGB token 位替换为 rgb_features（可选）
+        # 2) Depth token 位替换为 depth_features（可选）
+        # 3) 两路都可缺失（由输入与占位 token 决定），实现缺模态推理路径
         output_attentions = output_attentions or self.config.output_attentions
         output_hidden_states = output_hidden_states or self.config.output_hidden_states
         return_dict = return_dict or self.config.use_return_dict
@@ -358,6 +383,7 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
         use_depth = depth_values is not None or (
             self.config.use_depth_modality and pixel_values is not None and intrinsic is not None
         )
+        # 与原 SpatialVLA 不同：depth 分支是否启用由独立条件控制，不依赖 RGB+P' 融合。
         if use_depth:
             if intrinsic is None:
                 raise ValueError("intrinsic is required when depth branch is used.")
@@ -461,6 +487,7 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
             model_inputs["position_ids"] += 1
 
         if cache_position[0] == 0:
+            # 生成时首步同时注入 RGB/Depth，后续 step 依赖 KV cache，避免重复编码。
             model_inputs["pixel_values"] = pixel_values
             model_inputs["depth_values"] = depth_values
 
@@ -485,7 +512,7 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
         model_inputs = model_inputs.to(torch.bfloat16).to(self.device)
         input_len = model_inputs["input_ids"].shape[-1]
         generation_outputs = self.generate(**model_inputs, max_new_tokens=256, do_sample=False)
-        return generation_outputs[:, input_len:]
+        return generation_outputs[:, input_len:] #只返回“新生成部分”
 
     @classmethod
     def from_pretrained(
@@ -503,6 +530,7 @@ class UniModalVLAForConditionalGeneration(UniModalVLAPreTrainedModel, Generation
         weights_only: bool = True,
         **kwargs,
     ):
+        #加载预训练模型
         model = super().from_pretrained(
             pretrained_model_name_or_path,
             *model_args,

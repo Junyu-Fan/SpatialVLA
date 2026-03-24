@@ -10,6 +10,9 @@ from transformers import HfArgumentParser, Trainer, TrainingArguments, set_seed
 
 from model.configuration_unimodalvla import UniModalVLAConfig
 from model.modeling_unimodalvla import UniModalVLAForConditionalGeneration
+from model import SpatialVLAProcessor, SpatialActionTokenizer
+from data.dataset import build_datasets
+from train.monkey_patch import concat_pad_data_collator
 
 
 logger = logging.getLogger(__name__)
@@ -26,12 +29,27 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    """
-    Placeholder for project-specific dataloader integration.
-    Phase 1 focuses on architecture wiring + smoke run.
-    """
-
-    train_json: Optional[str] = field(default=None, metadata={"help": "Optional local json for custom dataset"})
+    data_root_dir: Optional[str] = field(
+        default="datasets/open-x-embodiment",
+        metadata={"help": "Root directory of OXE/RLDS datasets."},
+    )
+    data_mix: Optional[str] = field(
+        default="bridge",
+        metadata={"help": "Dataset mixture name (e.g., bridge, fractal20220817_data)."},
+    )
+    max_seq_length: Optional[int] = field(default=2048)
+    shuffle_buffer_size: Optional[int] = field(default=1000_000)
+    tsfm_thread_muti: Optional[int] = field(default=1)
+    read_thread_muti: Optional[int] = field(default=1)
+    obs_backward_steps: Optional[int] = field(default=0)
+    obs_backward_delta: Optional[int] = field(default=1)
+    action_forward_steps: Optional[int] = field(default=3)
+    fix_raw_length: Optional[int] = field(default=None)
+    use_raw_dataloader: Optional[bool] = field(default=False)
+    use_dummy_dataset: bool = field(
+        default=False,
+        metadata={"help": "Use random dummy dataset for smoke test instead of OXE pipeline."},
+    )
 
 
 class DummyPhase1Dataset(torch.utils.data.Dataset):
@@ -108,6 +126,12 @@ def main():
 
     torch_dtype = torch.bfloat16 if training_args.bf16 else torch.float32
 
+    if not data_args.use_dummy_dataset and not model_args.model_name_or_path:
+        raise ValueError(
+            "For OXE dataset mode, `model_name_or_path` is required so processor/tokenizer can be loaded. "
+            "Set `--use_dummy_dataset True` for smoke test without checkpoint."
+        )
+
     if model_args.model_name_or_path:
         config = UniModalVLAConfig.from_pretrained(
             model_args.model_name_or_path,
@@ -132,19 +156,62 @@ def main():
 
     maybe_freeze(model, model_args)
 
-    dummy_train = DummyPhase1Dataset(
-        length=16,
-        seq=2 * model.config.text_config.num_image_tokens + 16,
-        vocab_size=model.config.text_config.vocab_size,
-        image_size=model.config.vision_config.image_size,
-        patch=model.config.vision_config.patch_size,
-    )
+    if data_args.use_dummy_dataset:
+        train_dataset = DummyPhase1Dataset(
+            length=16,
+            seq=2 * model.config.text_config.num_image_tokens + 16,
+            vocab_size=model.config.text_config.vocab_size,
+            image_size=model.config.vision_config.image_size,
+            patch=model.config.vision_config.patch_size,
+        )
+        tokenizer = None
+        data_collator = collate_batch
+    else:
+        logger.info(f"Building OXE dataset with data_mix={data_args.data_mix}")
+        train_dataset, _ = build_datasets(
+            data_args,
+            training_args.output_dir,
+            vla_processor=None,
+        )
+
+        base_processor = SpatialVLAProcessor.from_pretrained(
+            model_args.model_name_or_path,
+            local_files_only=True,
+        )
+        tokenizer = base_processor.tokenizer
+        action_tokenizer = SpatialActionTokenizer(
+            tokenizer,
+            num_bins=base_processor.action_config["num_bins"],
+            bin_policy=base_processor.action_tokenizer.bin_policy,
+            use_spherical=base_processor.action_config["use_spherical"],
+            min_sigma=base_processor.action_config.get("min_sigma", 0.0),
+        )
+
+        processor = SpatialVLAProcessor(
+            image_processor=base_processor.image_processor,
+            tokenizer=tokenizer,
+            statistics=base_processor.statistics,
+            bin_policy=action_tokenizer.bin_policy,
+            intrinsic_config=base_processor.intrinsic_config,
+            action_config=base_processor.action_config,
+            num_obs_steps=data_args.obs_backward_steps + 1,
+            obs_delta=data_args.obs_backward_delta,
+            action_chunk_size=data_args.action_forward_steps + 1,
+        )
+        train_dataset.vla_processor = processor
+
+        # 当前 Phase1 使用 SpatialVLA 的 processor 输入协议进行可比测试。
+        # 由于该协议默认不生成 <depth> token，占位替换只走 image 分支。
+        # 为避免深度分支强制替换报错，这里关闭 depth 分支。
+        model.config.use_depth_modality = False
+        data_collator = concat_pad_data_collator
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dummy_train if training_args.do_train else None,
-        data_collator=collate_batch,
+        train_dataset=train_dataset if training_args.do_train else None,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
     )
 
     if training_args.do_train:
